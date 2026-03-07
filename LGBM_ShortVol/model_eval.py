@@ -14,7 +14,11 @@ print("⏳ Chargement des données de test...")
 df_BTC = pd.read_csv("/home/ryan/GitProject/IV_Model/LGBM_ShortVol/df_4h_feature.csv")
 MAX_TAU = 1.0 / 4 / 24 / 365.25 # 4h
 df_BTC = df_BTC[(df_BTC['tau'] <= MAX_TAU)]
-features = ['M', 'tau','r', 'abs_dist_ATM', 'RV_30m', 'Mom_30m', 'RV_Ratio', 'Parkinson_30m','smile_curve','M_squared','tau_sqrt']
+features = [
+    'M', 'tau', 'abs_dist_ATM', 'RV_30m', 'Mom_30m', 'RV_Ratio', 'Parkinson_30m',
+    'Mom_4h', 'Mom_24h', 'Dist_SMA_4h', 'Dist_SMA_24h', 'RSI_14h', 
+    'RV_24h', 'Vol_Ratio_30m_24h', 'Hour_of_day', 'Day_of_week'
+]
 target = 'iv'
 
 # Même mélange et nettoyage que lors de l'entraînement
@@ -32,9 +36,9 @@ _, X_test, _, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 # ==========================================
 print("🤖 Chargement des modèles champions...")
 live_xgb = xgb.XGBRegressor()
-live_xgb.load_model("/home/ryan/GitProject/IV_Model/LGBM_ShortVol/best_xgb_model_r_4h.json")
+live_xgb.load_model("/home/ryan/GitProject/IV_Model/LGBM_ShortVol/models/best_xgb_model_r_4h_v2_s.json")
 
-live_lgb = joblib.load("/home/ryan/GitProject/IV_Model/LGBM_ShortVol/best_lgbm_model_r_4h.pkl")
+live_lgb = joblib.load("/home/ryan/GitProject/IV_Model/LGBM_ShortVol/models/best_lgbm_model_r_4h.pkl")
 
 # ==========================================
 # 3. PRÉDICTIONS ET MÉTRIQUES
