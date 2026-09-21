@@ -79,26 +79,12 @@ async def watch_spot_price():
 
 # --- NOUVELLE FONCTION watch_clob_market (ADAPTÉE MAKER) ---
 
-async def watch_clob_market(queue, portfolio):
-    """
-    Surveille le carnet avec DOUBLE FILTRE :
-    1. Anti-Décimales (Rejette 0.579...)
-    2. Anti-Trou d'Air (Rejette Spread > 10cts)
-    """
+async def watch_clob_market(queue):
+    """Surveille le carnet et envoie le vecteur riche [bid_up, ask_up, bid_dn, ask_dn, ...]"""
     last_print_time = 0.0
     
-    # Mémoire du dernier carnet valide
-    last_valid_book = {
-        "bid_up": 0.0, "ask_up": 0.0,
-        "bid_dn": 0.0, "ask_dn": 0.0
-    }
-    
-    # --- HELPER: Vérifie si le prix est "propre" (2 décimales max) ---
-    def is_clean_price(p):
-        # On tolère une marge d'erreur infime pour les calculs flottants
-        return abs(p - round(p, 2)) < 1e-9
-
     while True:
+        # 1. Récupération des IDs via ton slug
         current_slug, current_ts, end_ts = get_current_slug_info()
         outcomes, asset_ids = fetch_market_info(current_slug)
         
@@ -132,10 +118,11 @@ async def watch_clob_market(queue, portfolio):
                         except: break
                 ping_task = asyncio.create_task(keep_alive_clob())
 
-                print(f"🎧 Flux Maker (Filtre 2 Décimales) actif pour : {current_slug}")
+                print(f"🎧 Flux Maker actif pour : {current_slug}")
 
                 while True:
                     now = time.time()
+                    
                     _, new_ts, _ = get_current_slug_info()
                     if new_ts != current_ts:
                         ping_task.cancel()
@@ -159,87 +146,33 @@ async def watch_clob_market(queue, portfolio):
                             direction = "Up" if asset == id_up else "Down" if asset == id_down else None
                             if not direction: continue
 
-                            # On extrait les prix bruts
-                            raw_bid = 0.0
-                            raw_ask = 0.0
-                            
                             if event_type == "book":
-                                if data.get("bids"): raw_bid = float(data["bids"][0]["price"])
-                                if data.get("asks"): raw_ask = float(data["asks"][0]["price"])
+                                if data.get("bids"): book[direction]["bid"] = float(data["bids"][0]["price"])
+                                if data.get("asks"): book[direction]["ask"] = float(data["asks"][0]["price"])
+                                state_changed = True
                             
                             elif event_type == "best_bid_ask":
-                                raw_bid = float(data.get("best_bid", 0.0))
-                                raw_ask = float(data.get("best_ask", 0.0))
-
-                            # ======================================================
-                            # 🛡️ FILTRE 1 : PURGE DES DÉCIMALES
-                            # ======================================================
-                            # Si on reçoit 0.579, on l'ignore (on garde l'ancienne valeur du book local)
-                            # Si on reçoit 0.58, on prend.
-                            
-                            if raw_bid > 0:
-                                if is_clean_price(raw_bid):
-                                    book[direction]["bid"] = raw_bid
-                                    state_changed = True
-                                # else: print(f"Ignored dirty bid: {raw_bid}")
-
-                            if raw_ask > 0:
-                                if is_clean_price(raw_ask):
-                                    book[direction]["ask"] = raw_ask
-                                    state_changed = True
-                                # else: print(f"Ignored dirty ask: {raw_ask}")
-
+                                book[direction]["bid"] = float(data.get("best_bid", 0.0))
+                                book[direction]["ask"] = float(data.get("best_ask", 0.0))
+                                state_changed = True
+                                            
                         # ======================================================
-                        # 🛡️ FILTRE 2 : COHÉRENCE DU SPREAD (Anti-Flash)
+                        # SÉCURITÉ ANTI-NONETYPE : ON VÉRIFIE SPOT ET STRIKE
                         # ======================================================
-                        if state_changed:
-                            b_up = book["Up"]["bid"]
-                            a_up = book["Up"]["ask"]
-                            b_dn = book["Down"]["bid"]
-                            a_dn = book["Down"]["ask"]
-                            
-                            # On vérifie que les prix ne sont pas à 0 (initialisation)
-                            if b_up > 0 and a_up > 0 and b_dn > 0 and a_dn > 0:
-                                
-                                spread_up = a_up - b_up
-                                spread_dn = a_dn - b_dn
-                                
-                                # Si le spread est sain (<= 10cts)
-                                if spread_up <= 0.10 and spread_dn <= 0.10:
-                                    
-                                    # C'est une donnée VALIDE et PROPRE
-                                    last_valid_book = {
-                                        "bid_up": b_up, "ask_up": a_up,
-                                        "bid_dn": b_dn, "ask_dn": a_dn
-                                    }
-                                    #print(f"UP BID {b_up} UP ASK {a_up} DN BID {b_dn} DN ASK {a_dn}")
-                                    # 🚀 VOIE RAPIDE (Matching Engine)
-                                    portfolio.process_pending_orders(
-                                        current_ask_up=a_up,
-                                        current_bid_up=b_up,
-                                        current_ask_down=a_dn,
-                                        current_bid_down=b_dn
-                                    )
-
-                        # ======================================================
-                        # 🐢 VOIE LENTE (XGBOOST)
-                        # ======================================================
-                        if current_spot_price is not None and K is not None:
+                        if state_changed and current_spot_price is not None and K is not None:
                             if (now - last_print_time) >= THROTTLE_DELAY:
-                                
-                                # On envoie uniquement si on a déjà une donnée valide en mémoire
-                                if last_valid_book["bid_up"] > 0:
-                                    rich_data = {
-                                        "bid_up": last_valid_book["bid_up"],
-                                        "ask_up": last_valid_book["ask_up"],
-                                        "bid_dn": last_valid_book["bid_dn"],
-                                        "ask_dn": last_valid_book["ask_dn"],
-                                        "strike": K,
-                                        "tau": round(max(0, end_ts - now), 2),
-                                        "spot": current_spot_price
-                                    }
-                                    await queue.put(("polymarket", rich_data))
-                                    last_print_time = now
+                                rich_data = {
+                                    "bid_up": book["Up"]["bid"],
+                                    "ask_up": book["Up"]["ask"],
+                                    "bid_dn": book["Down"]["bid"],
+                                    "ask_dn": book["Down"]["ask"],
+                                    "strike": K,
+                                    "tau": round(max(0, end_ts - now), 2),
+                                    "spot": current_spot_price
+                                }
+                                await queue.put(("polymarket", rich_data))
+                                last_print_time = now
+                        # ======================================================
 
                     except asyncio.TimeoutError:
                         continue

@@ -8,8 +8,44 @@ from feature_engine import FeatureEngine
 from pricing import BS_Bin,BS_Bin_Skew
 from trade import calculate_trade_signal,PaperTrader
 from trade_logger import TradeRecorder
-from helper import expiration_watchdog,get_optimal_maker_price
 
+async def expiration_watchdog(portfolio):
+    """
+    Force la fermeture 10s avant la fin en utilisant le dernier prix connu.
+    """
+    print("👮 Watchdog d'expiration activé.")
+    
+    while True:
+        await asyncio.sleep(1)
+        now = time.time()
+        
+        # Fin du cycle de 15 minutes (ex: 14:00, 14:15...)
+        current_window_end = (int(now) // 900 + 1) * 900
+        seconds_remaining = current_window_end - now
+        
+        # ZONE DE DANGER : Moins de 10 secondes
+        if seconds_remaining < 10.0:
+            
+            if portfolio.positions:
+                print(f"⏰ URGENT : Fin du cycle dans {seconds_remaining:.1f}s ! Force Close...")
+                
+                active_directions = list(portfolio.positions.keys())
+                
+                for direction in active_directions:
+                    # 1. On récupère la position pour voir son dernier prix
+                    pos_data = portfolio.positions.get(direction)
+                    
+                    if pos_data:
+                        # 2. On utilise le dernier prix vu par le bot (mis à jour à chaque tick)
+                        # Si jamais le prix est None (bug), on met 0 par sécurité pour ne pas inventer d'argent
+                        exit_price = pos_data.get("last_price", 0.0)
+                        
+                        portfolio.close_position(direction, exit_price, "FORCE CLOSE (Watchdog)")
+                
+                portfolio.print_stats() # On affiche les stats après le nettoyage
+                print("🧹 Portefeuille nettoyé.")
+                
+            await asyncio.sleep(10)
 
 
 async def orchestrator():
@@ -29,14 +65,13 @@ async def orchestrator():
     asyncio.create_task(engine.watch_binance_1m())
     asyncio.create_task(fetch_options_dataset(data_queue))
     asyncio.create_task(watch_spot_price()) # Met à jour la variable globale dans polymarket_live
-    
+    asyncio.create_task(watch_clob_market(data_queue))
     
     # 3. Mémoire d'état du marché
     latest_deribit_dataset = None
     recorder = TradeRecorder()
     portfolio = PaperTrader(initial_balance=500.0,recorder=recorder)
     print("🎧 En écoute des flux live...")
-    asyncio.create_task(watch_clob_market(data_queue, portfolio))
     asyncio.create_task(expiration_watchdog(portfolio))
     
     # ⏱️ PARAMÈTRE DE PERSISTANCE
@@ -93,6 +128,9 @@ async def orchestrator():
                 #print(f"⚠️ Spread trop large ({spread_up:.2f}), on ignore.")
                 market_is_healthy = False
 
+            # --- 3. MISE À JOUR DU PORTFOLIO (VALORISATION) ---
+            # Si on possède des parts, elles valent ce que les acheteurs offrent (BID)
+            # C'est la "Mark-to-Market" valuation.
             if "UP" in portfolio.positions:
                 portfolio.update_price("UP", bid_up) 
             if "DOWN" in portfolio.positions:
@@ -108,53 +146,38 @@ async def orchestrator():
                     sigma = float(live_xgb.predict(X_live)[0])
                     r_live = float(X_live[0][2])
                     
-                    fair_up, fair_dn = BS_Bin(spot_price, r_live, strike_k, sigma, tau_years)
-                    # ==========================================
-                    # 🛡️ PROTECTION ACTIVE : SURVEILLANCE DES ORDRES EN ATTENTE
-                    # Si la FV chute alors qu'on attend, on annule l'ordre !
-                    # ==========================================
-                    if portfolio.pending_orders:
-                        # On itère sur une copie [:] pour pouvoir supprimer sans casser la boucle
-                        for order in portfolio.pending_orders[:]:
-                            
-                            # 1. On identifie la FV actuelle correspondant au sens de l'ordre
-                            current_fv_check = 0.0
-                            if "UP" in order["direction"]:
-                                current_fv_check = fair_up
-                            elif "DOWN" in order["direction"]:
-                                current_fv_check = fair_dn
-                            
-                            # 2. On recalcule l'Edge en temps réel
-                            # Edge actuel = La valeur que le modèle donne MAINTENANT - Le prix qu'on a promis de payer
-                            current_edge = current_fv_check - order["limit_price"]
-                            
-                            # 3. Critère d'annulation (Même seuil que pour l'entrée : 0.025)
-                            # Si l'Edge passe sous 1.5% (marge de sécu), on fuit.
-                            MIN_MAINTENANCE_EDGE = 0.06 
-                            
-                            if current_edge < MIN_MAINTENANCE_EDGE:
-                                reason = f"FV Chute (FV: {current_fv_check:.3f} - Prix: {order['limit_price']:.3f} = Edge {current_edge:.3f})"
-                                portfolio.cancel_specific_order(order, reason=reason)
-                                
-                                # IMPORTANT : Si on annule l'ordre, on doit aussi tuer le signal en cours
-                                # pour éviter que le bot ne le replace immédiatement à la boucle suivante
-                                pending_signal = {"direction": None, "start_time": None}
-                    # --- DÉFINITIONS DES PRIX D'EXÉCUTION ---
+                    # --- CORRECTION DU SKEW : DIFFÉRENCE CENTRALE + LISSAGE ---
+                    # Au lieu de K+100, on prend K-500 et K+500 pour "gommer" les marches d'escalier de XGBoost
+                    # delta_k = 500.0 
+                    # X_live_plus = engine.get_live_vector(spot_price, strike_k + delta_k, tau_years)
+                    # X_live_minus = engine.get_live_vector(spot_price, strike_k - delta_k, tau_years)
                     
-                    # 1. PRIX DE SORTIE (TAKER SELL)
-                    # Si on veut sortir d'urgence, on vend à l'acheteur présent -> LE BID
+                    # sigma_plus = float(live_xgb.predict(X_live_plus)[0])
+                    # sigma_minus = float(live_xgb.predict(X_live_minus)[0])
+                    
+                    # # Calcul de la pente sur une large zone (Central Difference)
+                    # raw_skew_slope = (sigma_plus - sigma_minus) / (2 * delta_k)
+                    
+                    # # --- SÉCURITÉ CRITIQUE : LE CLAMPING ---
+                    # # Un vrai "Skew Slope" sur le BTC dépasse rarement 0.00005 par dollar.
+                    # # On bloque la valeur pour empêcher le Vega d'exploser le prix binaire.
+                    # MAX_SKEW_SLOPE = 0.00005
+                    # skew_slope = max(-MAX_SKEW_SLOPE, min(MAX_SKEW_SLOPE, raw_skew_slope))
+                    # print(raw_skew_slope)
+                    # # 2. Pricing Binaire avec Ajustement du Skew sécurisé
+                    # fair_up, fair_dn = BS_Bin_Skew(spot_price, r_live, strike_k, sigma, tau_years,raw_skew_slope)
+                    fair_up, fair_dn = BS_Bin(spot_price, r_live, strike_k, sigma, tau_years)
+                    # --- MODE MAKER : ON UTILISE LE BID ---
+                    # Pour l'entrée : C'est notre prix cible (Limit Order).
+                    # Pour la sortie : C'est le prix de vente immédiat (Market Sell).
                     prix_up_sortie = bid_up if bid_up > 0 else 0.001
                     prix_down_sortie = bid_dn if bid_dn > 0 else 0.001
-                    
-                    # 2. PRIX D'ENTRÉE (MAKER BUY)
-                    # On veut se placer dans la file d'attente -> LE BID (ou Bid + Tick)
-                    prix_up_entre = bid_up if bid_up > 0 else 0.001
-                    prix_down_entre = bid_dn if bid_dn > 0 else 0.001
-                    
+                    prix_up_entre = ask_up if ask_up > 0 else 0.001
+                    prix_down_entre = ask_dn if ask_dn > 0 else 0.001
                     print(f"📉 SPOT: {spot_price:.1f} | 🎯 K: {strike_k:.1f} | ⏳ {tau_years*365*24*60:.1f}m || "
                               f"🟢 UP: {prix_up_entre:.3f} (Fair {fair_up:.3f}) | "
                               f"🔴 DN: {prix_down_entre:.3f} (Fair {fair_dn:.3f})")
-
+                    # ... (Suite : Exécution du trade, inchangée) ...
                     
                     # ==========================================
                 # 2. GESTION DES SORTIES (BASÉE SUR LA FAIR VALUE)
@@ -211,7 +234,7 @@ async def orchestrator():
                         # B. SCÉNARIO "LOCK-IN" : On est dans la Zone (95% de la FV) mais ça faiblit
                         if current_p <= proximity_zone_high :
                             if current_p >= proximity_zone_low and current_p >= entry * 1.02:
-                                if dd_from_top > 0.015: 
+                                if dd_from_top > 0.01: 
                                     reason = f"LOCK PROFIT (Zone FV atteinte mais rejet)"
                                     portfolio.close_position(direction, current_p, reason, exit_spot=spot_price)
 
@@ -279,103 +302,86 @@ async def orchestrator():
                     print(f"⚠️ Erreur Sortie: {e}")
 
                     # ==========================================
-                    # 3. GESTION DES ENTRÉES (MODE MAKER / POST-ONLY)
+                    # 3. GESTION DES ENTRÉES AVEC CONFIRMATION (MODE MAKER)
                     # ==========================================
                 try:
-                    # On ne rentre que si on n'a pas déjà une POSITION active
-                    # (Note: On a le droit d'avoir un ORDRE en attente, on le mettra à jour)
                     if not portfolio.positions:
                         
-                        # A. DÉFINITION DES PRIX CIBLES (MAKER)
-                        # Pour le signal, on regarde le BID (car c'est là qu'on va se battre)
-                        # Si on visait l'Ask, on serait Taker.
-                        signal_price_up = bid_up
-                        signal_price_down = bid_dn
-
-                        # B. CALCUL DU SIGNAL
+                        # 1. On demande au modèle ce qu'il en pense (Basé sur le BID)
+                        # Note: prix_up et prix_down sont ici égaux aux BIDs (défini au bloc 4)
                         action, taille_mise, raison = calculate_trade_signal(
-                            signal_price_up, signal_price_down, fair_up, fair_dn, tau_years, portfolio.balance
+                            prix_up_entre, prix_down_entre, fair_up, fair_dn, tau_years, portfolio.balance
                         )
                         
-                        # C. SI AUCUN SIGNAL (HOLD)
+                        # A. SI AUCUN SIGNAL (HOLD)
                         if action == "HOLD":
                             if pending_signal["direction"] is not None:
-                                # On abandonne le signal en cours
+                                #print(f"❌ Signal {pending_signal['direction']} perdu ! (Bruit de marché)")
+                                # On remet le chrono à zéro
                                 pending_signal = {"direction": None, "start_time": None}
-                                # OPTIONNEL : Si on avait un ordre en attente sur le marché, on pourrait l'annuler ici
-                                # portfolio.cancel_all_orders() 
                         
-                        # D. SI SIGNAL DÉTECTÉ
+                        # B. SI SIGNAL DÉTECTÉ (MAKER_BUY_UP ou MAKER_BUY_DOWN)
                         else:
+                            # CORRECTION CRITIQUE ICI :
+                            # Le signal est "MAKER_BUY_UP". 
+                            # split("_") donne ['MAKER', 'BUY', 'UP']
+                            # On veut le dernier élément : [-1]
                             current_direction = action.split("_")[-1] # "UP" ou "DOWN"
                             
-                            # Vérification Cooldown
                             now = time.time()
                             if now < trading_cooldowns.get(current_direction, 0):
+                                #remaining = int(trading_cooldowns[current_direction] - now)
+                                # On spamme pas le log, on affiche juste une fois de temps en temps si tu veux
+                                # print(f"❄️ Signal {current_direction} ignoré (Cooldown actif: {remaining}s restants)")
+                                
+                                # ON FORCE LE HOLD
                                 action = "HOLD" 
                                 pending_signal = {"direction": None, "start_time": None}
-                            
-                            # --- LOGIQUE DE CONFIRMATION ---
-                            # Cas 1 : Nouveau signal
-                            else :
-                                if pending_signal["direction"] != current_direction:
-                                    print(f"⏳ Signal {current_direction} détecté... Attente stabilité ({CONFIRMATION_DELAY}s)")
-                                    pending_signal["direction"] = current_direction
-                                    pending_signal["start_time"] = now
+                                
+                            # Cas 1 : C'est un nouveau signal
+                            if pending_signal["direction"] != current_direction:
+                                print(f"⏳ Signal {current_direction} détecté... Attente stabilité ({CONFIRMATION_DELAY}s)")
+                                pending_signal["direction"] = current_direction
+                                pending_signal["start_time"] = now
+                                
+                            # Cas 2 : C'est le même signal qui persiste
+                            else:
+                                elapsed = now - pending_signal["start_time"]
+                                
+                                if elapsed >= CONFIRMATION_DELAY:
+                                    print(f"🚀 SIGNAL MAKER CONFIRMÉ ({elapsed:.1f}s) !")
                                     
-                                # Cas 2 : Signal confirmé
-                                else:
-                                    elapsed = now - pending_signal["start_time"]
+                                    # Nettoyage variables pour CSV
+                                    clean_sigma = float(sigma) if isinstance(sigma, (float, int)) else float(sigma[0])
+                                    clean_x_vector = X_live[0].tolist() if hasattr(X_live[0], 'tolist') else list(X_live[0])
+
+                                    # Fair Value Initiale
+                                    initial_fv = float(fair_up) if current_direction == "UP" else float(fair_dn)
                                     
-                                    if elapsed >= CONFIRMATION_DELAY:
-                                        # --- C'EST ICI QUE ÇA CHANGE ---
-                                        
-                                        # 1. Calcul du Prix "Sniper Maker"
-                                        # On veut être devant le Bid, mais sans toucher l'Ask
-                                        if current_direction == "UP":
-                                            limit_price = get_optimal_maker_price("UP", bid_up, ask_up)
-                                        else:
-                                            limit_price = get_optimal_maker_price("DOWN", bid_dn, ask_dn)
+                                    meta_data = {
+                                        "entry_spot": float(spot_price) if spot_price else 0.0,
+                                        "sigma_pred": clean_sigma,
+                                        "x_live_vector": clean_x_vector, 
+                                        "bid_entry": float(bid_up) if current_direction == "UP" else float(bid_dn),
+                                        "ask_entry": float(ask_up) if current_direction == "UP" else float(ask_dn),
+                                        "fair_value": initial_fv 
+                                    }
 
-                                        print(f"🚀 SIGNAL CONFIRMÉ ! Placement Ordre {current_direction} @ {limit_price}")
-
-                                        # 2. Préparation Metadata (Pour CSV)
-                                        clean_sigma = float(sigma) if isinstance(sigma, (float, int)) else float(sigma[0])
-                                        clean_x_vector = X_live[0].tolist() if hasattr(X_live[0], 'tolist') else list(X_live[0])
-                                        initial_fv = float(fair_up) if current_direction == "UP" else float(fair_dn)
-                                        
-                                        meta_data = {
-                                            "entry_spot": float(spot_price) if spot_price else 0.0,
-                                            "sigma_pred": clean_sigma,
-                                            "x_live_vector": clean_x_vector, 
-                                            "bid_entry": float(bid_up) if current_direction == "UP" else float(bid_dn),
-                                            "ask_entry": float(ask_up) if current_direction == "UP" else float(ask_dn),
-                                            "fair_value": initial_fv 
-                                        }
-
-                                        # 3. ENVOI DE L'ORDRE (POST-ONLY)
-                                        # On appelle notre nouvelle fonction PaperTrader
-                                        # Note : La direction envoyée doit matcher ce que 'place_post_only_order' attend
-                                        # Elle attend "MAKER_BUY_UP" ou "MAKER_BUY_DOWN"
-                                        maker_direction_tag = f"MAKER_BUY_{current_direction}"
-                                        
-                                        portfolio.place_post_only_order(
-                                            maker_direction_tag, 
-                                            limit_price, 
-                                            taille_mise, 
-                                            metadata=meta_data
-                                        )
-                                        
-                                        # On ne reset PAS forcément le pending_signal ici si on veut faire du "Chasing" 
-                                        # (mise à jour du prix). Mais pour commencer simple, on reset.
-                                        pending_signal = {"direction": None, "start_time": None}
-                                        
+                                    if current_direction == "UP":
+                                        portfolio.open_position("UP", prix_up_entre, taille_mise, metadata=meta_data)
                                     else:
-                                        # On attend encore
-                                        pass
-
+                                        portfolio.open_position("DOWN", prix_down_entre, taille_mise, metadata=meta_data)
+                                    
+                                        
+                                    # On reset le chrono après le tir
+                                    pending_signal = {"direction": None, "start_time": None}
+                                    
+                                else:
+                                    # On attend encore un peu...
+                                    pass
+                            
                 except Exception as e:
-                    print(f"⚠️ Erreur logique entrée: {e}")
+                    print(f"⚠️ Erreur tick: {e}")
             else:
                 # DEBUG : On affiche ce qui bloque le démarrage
                 status_deribit = "✅" if latest_deribit_dataset is not None else "❌"
